@@ -1,0 +1,318 @@
+From 5c29cda90654d1465591c1ed2c06e20b1efa0783 Mon Sep 17 00:00:00 2001
+From: isaacjamessss <isaac21092@gmail.com>
+Date: Tue, 17 Nov 2026 23:27:46 -0600
+Subject: [PATCH] 0073
+
+---
+ src/gallium/frontends/d3d10umd/Device.cpp   |   1 +
+ src/gallium/frontends/d3d10umd/DxgiFns.cpp  |   7 +-
+ src/gallium/frontends/d3d10umd/Resource.cpp | 172 ++++++++++++++++++++
+ src/gallium/frontends/d3d10umd/State.h      |  19 +++
+ src/gallium/targets/d3d10umd/d3d10_gdi.c    |  27 +++
+ 5 files changed, 225 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
+index 131187f..eb5b96f 100644
+--- a/src/gallium/frontends/d3d10umd/Device.cpp
++++ b/src/gallium/frontends/d3d10umd/Device.cpp
+@@ -403,6 +403,7 @@ DestroyDevice(D3D10DDI_HDEVICE hDevice)   // IN
+    pipe->set_sampler_views(pipe, MESA_SHADER_GEOMETRY, 0,
+                            PIPE_MAX_SHADER_SAMPLER_VIEWS, 0, sampler_views);
+ 
++   PresentRotatedDestroy(pDevice);
+    pipe->destroy(pipe);
+    pDevice->screen->destroy(pDevice->screen);
+    /* The shim keeps a set of state per runtime device. */
+diff --git a/src/gallium/frontends/d3d10umd/DxgiFns.cpp b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
+index 72b6d12..45c97c9 100644
+--- a/src/gallium/frontends/d3d10umd/DxgiFns.cpp
++++ b/src/gallium/frontends/d3d10umd/DxgiFns.cpp
+@@ -105,7 +105,12 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
+     * a kernel that shows the primary before they are done, is one file away.
+     */
+    if (pSrcResource->direct_primary) {
+-      if (PresentWaitsForGpu()) {
++      /* Landscape on a portrait panel: the frame goes to the screen turned,
++       * and the flip below only completes the runtime's flip chain. */
++      t0 = d3d10_perf_now();
++      if (PresentRotated(device, pSrcResource))
++         d3d10_perf_add(D3D10_PERF_ROTATE, t0);
++      else if (PresentWaitsForGpu()) {
+          t0 = d3d10_perf_now();
+          d3d10_wait_idle(device->hDevice);
+          d3d10_perf_add(D3D10_PERF_IDLE_IN_PRESENT, t0);
+diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
+index aeedcb1..f3e5c55 100644
+--- a/src/gallium/frontends/d3d10umd/Resource.cpp
++++ b/src/gallium/frontends/d3d10umd/Resource.cpp
+@@ -43,6 +43,8 @@
+ #include "util/u_surface.h"
+ #include "util/mali_slow.h"
+ #include "frontend/winsys_handle.h"
++#include "tgsi/tgsi_text.h"
++#include "nir/tgsi_to_nir.h"
+ 
+ #include <io.h>
+ 
+@@ -142,6 +144,176 @@ SwitchFileAbsent(const char *path, const char *what_absent, const char *what_pre
+ }
+ 
+ 
++/*
++ * gs101 landscape. The Pixel 6's display controller turns only YUV 4:2:0
++ * (Google's exynos_drm_dpp.c: "support rotation only for YUV420 format"),
++ * so with the path rotated 90 or 270 the desktop's landscape primary is
++ * turned on the GPU: a compute shader moves every pixel into one of two
++ * portrait buffers that maliwddm keeps on framebuffers A and B
++ * (MW_ALLOC_SCANOUT), and MW_ESCAPE_SHOW points the display at it. One read
++ * and one write of the frame on the GPU, nothing on the CPU.
++ */
++static void *
++RotateShader(struct pipe_context *pipe, unsigned rotation, unsigned src_w, unsigned src_h)
++{
++   char text[1536];
++   struct tgsi_token tokens[1000];
++   struct pipe_compute_state cs;
++
++   /* TEMP[0] the portrait pixel (x, y), TEMP[1] (src_h - 1 - x, src_w - 1 - y);
++    * 90: from (y, src_h - 1 - x), 270: from (src_w - 1 - y, x). */
++   const char *pick = rotation == 2 ? "MOV TEMP[2].x, TEMP[0].yyyy\n"
++                                      "MOV TEMP[2].y, TEMP[1].xxxx\n"
++                                    : "MOV TEMP[2].x, TEMP[1].yyyy\n"
++                                      "MOV TEMP[2].y, TEMP[0].xxxx\n";
++   snprintf(text, sizeof text,
++            "COMP\n"
++            "PROPERTY CS_FIXED_BLOCK_WIDTH 8\n"
++            "PROPERTY CS_FIXED_BLOCK_HEIGHT 8\n"
++            "PROPERTY CS_FIXED_BLOCK_DEPTH 1\n"
++            "DCL SV[0], THREAD_ID\n"
++            "DCL SV[1], BLOCK_ID\n"
++            "DCL IMAGE[0], 2D, PIPE_FORMAT_R32_UINT\n"
++            "DCL IMAGE[1], 2D, PIPE_FORMAT_R32_UINT, WR\n"
++            "DCL TEMP[0..3]\n"
++            "IMM[0] UINT32 { 8, 8, 0, 0}\n"
++            "IMM[1] UINT32 { %u, %u, 0, 0}\n"
++            "MOV TEMP[0], IMM[0].zzzz\n"
++            "MOV TEMP[2], IMM[0].zzzz\n"
++            "UMAD TEMP[0].xy, SV[1], IMM[0], SV[0]\n"
++            "INEG TEMP[1].xy, TEMP[0]\n"
++            "UADD TEMP[1].xy, TEMP[1], IMM[1]\n"
++            "%s"
++            "LOAD TEMP[3], IMAGE[0], TEMP[2], 2D, PIPE_FORMAT_R32_UINT\n"
++            "STORE IMAGE[1], TEMP[0], TEMP[3], 2D, PIPE_FORMAT_R32_UINT\n"
++            "END\n",
++            src_h - 1, src_w - 1, pick);
++   if (!tgsi_text_translate(text, tokens, ARRAY_SIZE(tokens))) {
++      DebugPrintf("rotate: the shader did not translate\n");
++      return NULL;
++   }
++   memset(&cs, 0, sizeof cs);
++   /* Panfrost takes compute kernels as NIR only */
++   cs.ir_type = PIPE_SHADER_IR_NIR;
++   cs.prog = tgsi_to_nir(tokens, pipe->screen, false);
++   if (!cs.prog)
++      return NULL;
++   return pipe->create_compute_state(pipe, &cs);
++}
++
++void
++PresentRotatedDestroy(Device *device)
++{
++   struct pipe_context *pipe = device->pipe;
++
++   for (unsigned i = 0; i < ARRAY_SIZE(device->rot_cs); i++) {
++      if (device->rot_cs[i])
++         pipe->delete_compute_state(pipe, device->rot_cs[i]);
++      device->rot_cs[i] = NULL;
++   }
++   for (unsigned i = 0; i < 2; i++)
++      pipe_resource_reference(&device->rot_fb[i], NULL);
++}
++
++bool
++PresentRotated(Device *device, Resource *src)
++{
++   struct pipe_context *pipe = device->pipe;
++   struct pipe_screen *screen = device->screen;
++   struct pipe_resource *s = src->resource;
++   unsigned rotation = 0, status = 0, fw = 0, fh = 0, fpitch = 0;
++   unsigned slot;
++
++   if (device->rot_failed || !pipe->create_compute_state || !pipe->launch_grid ||
++       !pipe->set_shader_images)
++      return false;
++   if (d3d10_scanout_show(device->hDevice, ~0u, &rotation,
++                          &status, &fw, &fh, &fpitch) < 0)
++      return false;
++   if (rotation != device->rot_last) {
++      DebugPrintf("rotate: path rotation %u, status 0x%x, framebuffer %ux%u pitch %u,"
++                  " primary %ux%u\n", rotation, status, fw, fh, fpitch,
++                  s->width0, s->height0);
++      device->rot_last = rotation;
++   }
++   if ((rotation != 2 && rotation != 4) || !(status & 1))
++      return false;
++   /* the landscape primary of exactly the turned framebuffer */
++   if (s->width0 != fh || s->height0 != fw || fw % 8 || fh % 8 || s->target != PIPE_TEXTURE_2D)
++      return false;
++
++   if (!device->rot_fb[0]) {
++      for (unsigned i = 0; i < 2; i++) {
++         struct pipe_resource t;
++         unsigned stride = 0, allocation;
++
++         memset(&t, 0, sizeof t);
++         t.target = PIPE_TEXTURE_2D;
++         t.format = PIPE_FORMAT_B8G8R8A8_UNORM;
++         t.width0 = fw;
++         t.height0 = fh;
++         t.depth0 = 1;
++         t.array_size = 1;
++         t.usage = PIPE_USAGE_DEFAULT;
++         t.bind = PIPE_BIND_SHADER_IMAGE | PIPE_BIND_SHARED | PIPE_BIND_SCANOUT |
++                  PIPE_BIND_LINEAR;
++         d3d10_scanout_begin(device->hDevice, fw, fh, fpitch, i);
++         device->rot_fb[i] = screen->resource_create(screen, &t);
++         allocation = d3d10_shared_end();
++         if (!device->rot_fb[i] || !allocation ||
++             !MarkResourceShared(pipe, device->rot_fb[i], &stride) || stride != fpitch) {
++            DebugPrintf("rotate: framebuffer %u: resource %p allocation 0x%x stride %u (want %u);"
++                        " not rotating\n", i, device->rot_fb[i], allocation, stride, fpitch);
++            PresentRotatedDestroy(device);
++            device->rot_failed = true;
++            return false;
++         }
++      }
++      device->rot_next = 1;     /* A is on screen */
++   }
++   if (!device->rot_cs[rotation]) {
++      device->rot_cs[rotation] = RotateShader(pipe, rotation, s->width0, s->height0);
++      if (!device->rot_cs[rotation]) {
++         device->rot_failed = true;
++         return false;
++      }
++   }
++
++   slot = device->rot_next;
++   struct pipe_image_view views[2];
++   memset(views, 0, sizeof views);
++   views[0].resource = s;
++   views[0].format = PIPE_FORMAT_R32_UINT;
++   views[0].access = views[0].shader_access = PIPE_IMAGE_ACCESS_READ;
++   views[1].resource = device->rot_fb[slot];
++   views[1].format = PIPE_FORMAT_R32_UINT;
++   views[1].access = views[1].shader_access = PIPE_IMAGE_ACCESS_WRITE;
++
++   struct pipe_grid_info info;
++   memset(&info, 0, sizeof info);
++   info.block[0] = 8;
++   info.block[1] = 8;
++   info.block[2] = 1;
++   info.grid[0] = fw / 8;
++   info.grid[1] = fh / 8;
++   info.grid[2] = 1;
++
++   pipe->bind_compute_state(pipe, device->rot_cs[rotation]);
++   pipe->set_shader_images(pipe, MESA_SHADER_COMPUTE, 0, 2, 0, views);
++   pipe->launch_grid(pipe, &info);
++   pipe->set_shader_images(pipe, MESA_SHADER_COMPUTE, 0, 0, 2, NULL);
++   pipe->bind_compute_state(pipe, NULL);
++   pipe->flush(pipe, NULL, 0);
++   d3d10_wait_idle(device->hDevice);
++   if (d3d10_scanout_show(device->hDevice, slot, NULL, NULL, NULL, NULL, NULL) < 0) {
++      DebugPrintf("rotate: show %u failed\n", slot);
++      return false;
++   }
++   device->rot_next = slot ^ 1;
++   return true;
++}
++
++
+ bool
+ PrimaryRenderedInto(void)
+ {
+diff --git a/src/gallium/frontends/d3d10umd/State.h b/src/gallium/frontends/d3d10umd/State.h
+index 3e976c6..aec473c 100644
+--- a/src/gallium/frontends/d3d10umd/State.h
++++ b/src/gallium/frontends/d3d10umd/State.h
+@@ -108,6 +108,15 @@ struct Device
+ 
+    unsigned max_dual_source_render_targets;
+ 
++   /* gs101 landscape (PresentRotated): the two portrait buffers on the
++    * framebuffers, the compute shaders that turn a frame into them (by
++    * D3DKMDT rotation, 2 and 4), which one is drawn next. */
++   struct pipe_resource *rot_fb[2];
++   void *rot_cs[5];
++   unsigned rot_next;
++   bool rot_failed;
++   unsigned rot_last;
++
+    D3D10DDI_HRTCORELAYER  hRTCoreLayer;
+ 
+    HANDLE hDevice;
+@@ -217,6 +226,10 @@ void d3d10_primary_begin_create(void *hRTDevice, void *hRTResource, unsigned w,
+                                 unsigned pitch, unsigned vidpn_source);
+ void d3d10_primary_rebind(void *hRTDevice, unsigned allocation, void *hRTResource);
+ void d3d10_wait_idle(void *hRTDevice);
++/* maliwddm MW_ESCAPE_SHOW; see malikm_drm.c. */
++void d3d10_scanout_begin(void *hRTDevice, unsigned w, unsigned h, unsigned pitch, unsigned slot);
++long d3d10_scanout_show(void *hRTDevice, unsigned slot, unsigned *rotation, unsigned *status,
++                        unsigned *w, unsigned *h, unsigned *pitch);
+ unsigned long long d3d10_perf_now(void);
+ void d3d10_perf_add(unsigned stage, unsigned long long since);
+ void d3d10_perf_frame(void);
+@@ -263,6 +276,12 @@ struct Resource
+  *   present-wait   a present of a rendered-into primary first waits for the
+  *                  GPU, instead of leaving the order to the scheduler */
+ bool PrimaryRenderedInto(void);
++/* gs101: a landscape primary turned into the portrait framebuffer and shown
++ * (Resource.cpp); false when the path is not rotated or this cannot be done. */
++struct Device;
++struct Resource;
++bool PresentRotated(struct Device *device, struct Resource *src);
++void PresentRotatedDestroy(struct Device *device);
+ bool RotateByExchange(void);
+ bool PresentWaitsForGpu(void);
+ 
+diff --git a/src/gallium/targets/d3d10umd/d3d10_gdi.c b/src/gallium/targets/d3d10umd/d3d10_gdi.c
+index 7f3170b..1e0646d 100644
+--- a/src/gallium/targets/d3d10umd/d3d10_gdi.c
++++ b/src/gallium/targets/d3d10umd/d3d10_gdi.c
+@@ -243,6 +243,33 @@ d3d10_primary_rebind(void *hRTDevice, unsigned allocation, void *hRTResource)
+ #endif
+ }
+ 
++void malikm_scanout_begin(void *hRTDevice, unsigned w, unsigned h, unsigned pitch, unsigned slot);
++long malikm_scanout_show(void *hRTDevice, unsigned slot, unsigned *rotation, unsigned *status,
++                         unsigned *w, unsigned *h, unsigned *pitch);
++
++/* gs101 rotation: the next buffer is framebuffer A's or B's (slot). */
++void
++d3d10_scanout_begin(void *hRTDevice, unsigned w, unsigned h, unsigned pitch, unsigned slot)
++{
++#ifdef GALLIUM_PANFROST
++   malikm_scanout_begin(hRTDevice, w, h, pitch, slot);
++#else
++   (void)hRTDevice; (void)w; (void)h; (void)pitch; (void)slot;
++#endif
++}
++
++long
++d3d10_scanout_show(void *hRTDevice, unsigned slot, unsigned *rotation, unsigned *status,
++                   unsigned *w, unsigned *h, unsigned *pitch)
++{
++#ifdef GALLIUM_PANFROST
++   return malikm_scanout_show(hRTDevice, slot, rotation, status, w, h, pitch);
++#else
++   (void)hRTDevice; (void)slot; (void)rotation; (void)status; (void)w; (void)h; (void)pitch;
++   return -1;
++#endif
++}
++
+ /* Wait until everything the device has submitted is done. */
+ void
+ d3d10_wait_idle(void *hRTDevice)
+-- 
+2.56.0
+

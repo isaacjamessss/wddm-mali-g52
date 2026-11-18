@@ -1809,6 +1809,7 @@ wddm_bo_is_resource(int fd, uint32_t handle)
 #define SHARED_CREATE 1
 #define SHARED_OPEN   2
 #define SHARED_PRIMARY 3        /* malikm_primary_begin_create, below */
+#define SHARED_SCANOUT 4        /* malikm_scanout_begin, below */
 #define SHARED_PRIV_MAX 128
 
 static __declspec(thread) struct {
@@ -1911,6 +1912,53 @@ malikm_wait_idle(void *hRTDevice)
    return ret;
 }
 
+/*
+ * gs101 rotation (maliwddm MW_ESCAPE_SHOW). The buffer Panfrost creates
+ * between malikm_scanout_begin and malikm_shared_end is a plain allocation
+ * of the device that the KMD maps onto framebuffer A (slot 0) or B (slot 1):
+ * d3d10umd draws the landscape primary into it turned, and shows it.
+ */
+void
+malikm_scanout_begin(void *hRTDevice, unsigned w, unsigned h, unsigned pitch, unsigned slot)
+{
+   memset(&shared_next, 0, sizeof(shared_next));
+   shared_next.mode = SHARED_SCANOUT;
+   shared_next.device = hRTDevice;
+   shared_next.w = w;
+   shared_next.h = h;
+   shared_next.pitch = pitch;
+   shared_next.vidpn_source = slot;
+}
+
+/* Show slot 0 or 1 (returns once the display reads it), or with slot ~0u
+ * only ask. *rotation: the path's (1 identity, 2 90, 4 270); *status bit 0:
+ * slots can be shown; *w, *h, *pitch: the framebuffer's. Negative: failed. */
+long
+malikm_scanout_show(void *hRTDevice, unsigned slot, unsigned *rotation, unsigned *status,
+                    unsigned *w, unsigned *h, unsigned *pitch)
+{
+   MW_ESCAPE_SHOW_DATA d = {0};
+   NTSTATUS st = (NTSTATUS)0xC0000001;
+
+   d.Code = MW_ESCAPE_SHOW;
+   d.Slot = slot;
+   wlock(__func__);
+   if (wselect_rt(hRTDevice) && ddi.on)
+      st = w_escape(&d, sizeof(d));
+   ReleaseSRWLockExclusive(&wddm_lock);
+   if (rotation)
+      *rotation = st < 0 ? 0 : d.Rotation;
+   if (status)
+      *status = st < 0 ? 0 : d.Status;
+   if (w)
+      *w = d.Width;
+   if (h)
+      *h = d.Height;
+   if (pitch)
+      *pitch = d.Pitch;
+   return st < 0 ? -1 : 0;
+}
+
 /* The allocation the BO was made on; 0 if no BO was created in between (a
  * BO from Panfrost's cache, or not the runtime's device) or it failed. */
 unsigned
@@ -1921,7 +1969,8 @@ malikm_shared_end(void)
    if (shared_next.mode && !shared_next.done)
       DebugPrintf("shared %s: resource %p: no buffer was made on the allocation\n",
                   shared_next.mode == SHARED_CREATE ? "create" :
-                  shared_next.mode == SHARED_PRIMARY ? "primary" : "open",
+                  shared_next.mode == SHARED_PRIMARY ? "primary" :
+                  shared_next.mode == SHARED_SCANOUT ? "scanout" : "open",
                   shared_next.rt_resource);
    memset(&shared_next, 0, sizeof(shared_next));
    return ret;
@@ -2005,7 +2054,8 @@ wddm_drm(uint32_t nr, uint8_t *b, uint32_t size)
 
       /* The primary's buffer holds all its rows; anything smaller made
        * first is something else. */
-      if (shared == SHARED_PRIMARY && sz < (uint64_t)shared_next.pitch * shared_next.h)
+      if ((shared == SHARED_PRIMARY || shared == SHARED_SCANOUT) &&
+          sz < (uint64_t)shared_next.pitch * shared_next.h)
          shared = 0;
 
       memset(&priv, 0, sizeof(priv));
@@ -2015,6 +2065,15 @@ wddm_drm(uint32_t nr, uint8_t *b, uint32_t size)
       ai.pPrivateDriverData = &priv;
       ai.PrivateDriverDataSize = sizeof(priv.pi);
       where.Code = MW_ESCAPE_ALLOC_INFO;
+      if (shared == SHARED_SCANOUT) {
+         /* A plain allocation of this device the KMD puts on framebuffer A's
+          * or B's pages (vidpn_source holds the slot). */
+         priv.pi.Flags |= MW_ALLOC_SCANOUT | (shared_next.vidpn_source ? MW_ALLOC_SCANOUT_B : 0);
+         priv.pi.Width = shared_next.w;
+         priv.pi.Height = shared_next.h;
+         priv.pi.Pitch = shared_next.pitch;
+         priv.pi.Format = D3DDDIFMT_A8R8G8B8;
+      }
 
       if (shared_next.mode && !shared)
          DebugPrintf("shared: another buffer of %llu bytes while resource %p is being made"
@@ -2138,7 +2197,13 @@ wddm_drm(uint32_t nr, uint8_t *b, uint32_t size)
          wbo_cap = cap;
       }
       wbo[h - 1] = (struct wbo){ai.hAllocation, where.Size, where.GpuVa, NULL};
-      if (shared) {
+      if (shared == SHARED_SCANOUT) {
+         shared_next.allocation = ai.hAllocation;
+         shared_next.done = 1;
+         DebugPrintf("scanout %u: allocation 0x%x at GPU 0x%llx, %llu bytes\n",
+                     shared_next.vidpn_source, (unsigned)ai.hAllocation,
+                     (unsigned long long)where.GpuVa, (unsigned long long)where.Size);
+      } else if (shared) {
          wbo[h - 1].rt_resource = shared_next.rt_resource;
          wbo[h - 1].rt_device = shared_next.device;
          wbo[h - 1].primary = shared == SHARED_PRIMARY;
@@ -2151,7 +2216,8 @@ wddm_drm(uint32_t nr, uint8_t *b, uint32_t size)
       MALI_SLOW(slow_t0, "bo-create", "%llu bytes, %s, %u live BOs on this device",
                 (unsigned long long)sz,
                 shared == SHARED_CREATE ? "shared" : shared == SHARED_OPEN ? "opened" :
-                shared == SHARED_PRIMARY ? "primary" : "plain", wbo_live());
+                shared == SHARED_PRIMARY ? "primary" :
+                shared == SHARED_SCANOUT ? "scanout" : "plain", wbo_live());
       /* Where every BO lives, so a GPU fault address can be traced back to
        * the buffer it fell in (the 0x4002c3 faults at a fixed VA). */
       if (trace_on())

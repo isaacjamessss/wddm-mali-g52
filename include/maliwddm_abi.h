@@ -25,6 +25,11 @@ typedef unsigned __int64 mw_u64;
 /* Allocation private data (D3DDDI_ALLOCATIONINFO.pPrivateDriverData). */
 #define MW_ALLOC_NOEXEC         0x1     /* not shader code: may lie anywhere, XN */
 #define MW_ALLOC_PRIMARY        0x2     /* scan-out capable (step d) */
+/* gs101: a portrait buffer of the framebuffer's shape the UMD draws a rotated
+ * (landscape) desktop into; its pages are framebuffer A's, or B's with
+ * MW_ALLOC_SCANOUT_B. Shown with MW_ESCAPE_SHOW. */
+#define MW_ALLOC_SCANOUT        0x4
+#define MW_ALLOC_SCANOUT_B      0x8
 
 typedef struct _MW_ALLOCATION_INFO {
     mw_u32 Version;                     /* MW_ABI_VERSION */
@@ -145,6 +150,22 @@ typedef struct _MW_ESCAPE_GPUCLK_DATA {
     mw_u32 Applied;                     /* what this driver last wrote, or 0: (Parent << 8) | Div */
     mw_u32 Stored;                      /* the setting kept for the next start, same form, or 0 */
 } MW_ESCAPE_GPUCLK_DATA;
+
+/* gs101 rotation. The display controller cannot rotate RGB, so with a
+ * rotated path (90 or 270) the UMD draws each landscape primary rotated
+ * into a MW_ALLOC_SCANOUT buffer and shows that: Slot 0 (A) or 1 (B), the
+ * call returns once the display reads it; Slot ~0 only reports.
+ * Rotation: the committed D3DKMDT_VIDPN_PRESENT_PATH_ROTATION (1 identity,
+ * 2 90, 4 270). Status: bit 0 two framebuffers and flips available. */
+#define MW_ESCAPE_SHOW          7
+typedef struct _MW_ESCAPE_SHOW_DATA {
+    mw_u32 Code;                        /* MW_ESCAPE_SHOW */
+    mw_u32 Slot;
+    mw_u32 Rotation;                    /* out */
+    mw_u32 Status;                      /* out */
+    mw_u32 Width, Height, Pitch;        /* out: the framebuffer's (portrait) */
+    mw_u32 LatchMiss;                   /* out: shows that had to wait for the previous one */
+} MW_ESCAPE_SHOW_DATA;
 #define MW_MEM_PROCS            64
 
 typedef struct _MW_MEM_PROC {
