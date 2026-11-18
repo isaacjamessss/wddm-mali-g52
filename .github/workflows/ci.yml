@@ -2,6 +2,9 @@ name: CI
 
 on:
   push:
+    # gs101 (Pixel 6) builds its kernel drivers locally (gpu/*-gs101); this
+    # workflow builds the RK3576 ones and would only hold runners there.
+    branches-ignore: [gs101]
   workflow_dispatch:
 
 permissions:

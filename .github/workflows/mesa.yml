@@ -20,6 +20,10 @@ on:
 permissions:
   contents: read
 
+# Quick mode on the gs101 (Pixel 6) branch while diagnosing: only libpan and the
+# ARM64 Panfrost d3d10umd (what dwm.exe loads) are built. Set the repository
+# variable FULL_BUILD to 1 for every job (x64/x86 UMDs, OpenGL ICDs, forwarders).
+
 env:
   MESA_TAG: mesa-26.2.0
   # gitlab.freedesktop.org was returning 502/504 when this was written; the
@@ -29,6 +33,7 @@ env:
 jobs:
   softpipe:
     name: d3d10umd + softpipe (ARM64)
+    if: ${{ github.ref_name != 'gs101' || vars.FULL_BUILD == '1' }}
     runs-on: windows-11-arm
     steps:
       - uses: actions/checkout@v4
@@ -383,6 +388,7 @@ jobs:
     # driver build in ci.yml: its image has the WDK, whose UMD DDI headers
     # (d3dumddi.h, d3d10umddi.h) d3d10umd needs.
     name: d3d10umd + softpipe + Panfrost (${{ matrix.arch }})
+    if: ${{ github.ref_name != 'gs101' || vars.FULL_BUILD == '1' }}
     needs: libpan-spirv
     runs-on: windows-2022
     strategy:
@@ -551,7 +557,7 @@ jobs:
     needs: [panfrost, panfrost-emulated]
     # It needs the ARM64 and the x64 DLL, not the x86 one: a failed x86
     # build does not stop it (a missing x64 artifact fails the download).
-    if: always() && needs.panfrost.result == 'success'
+    if: always() && needs.panfrost.result == 'success' && (github.ref_name != 'gs101' || vars.FULL_BUILD == '1')
     runs-on: windows-11-arm
     steps:
       - uses: actions/checkout@v4
@@ -640,6 +646,7 @@ jobs:
     # native programs, x64 for emulated ones (behind an ARM64X forwarder,
     # below), x86 for WOW64 ones (OpenGLDriverNameWow).
     name: OpenGL ICD, Panfrost + softpipe (${{ matrix.arch }})
+    if: ${{ github.ref_name != 'gs101' || vars.FULL_BUILD == '1' }}
     needs: libpan-spirv
     runs-on: ${{ matrix.os }}
     strategy:
@@ -860,7 +867,7 @@ jobs:
     # giving it the name Mesa's opengl32.dll stand-in imports.
     name: maligl.dll, ARM64X forwarder for the OpenGL ICD
     needs: wgl
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && (github.ref_name != 'gs101' || vars.FULL_BUILD == '1') }}
     runs-on: windows-11-arm
     steps:
       - uses: actions/checkout@v4
