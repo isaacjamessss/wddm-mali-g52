@@ -1,4 +1,4 @@
-From 5c29cda90654d1465591c1ed2c06e20b1efa0783 Mon Sep 17 00:00:00 2001
+From 30f8ac1a7175503f4e302ef9bab19f7e573f5779 Mon Sep 17 00:00:00 2001
 From: isaacjamessss <isaac21092@gmail.com>
 Date: Tue, 17 Nov 2026 23:27:46 -0600
 Subject: [PATCH] 0073
@@ -6,10 +6,10 @@ Subject: [PATCH] 0073
 ---
  src/gallium/frontends/d3d10umd/Device.cpp   |   1 +
  src/gallium/frontends/d3d10umd/DxgiFns.cpp  |   7 +-
- src/gallium/frontends/d3d10umd/Resource.cpp | 172 ++++++++++++++++++++
+ src/gallium/frontends/d3d10umd/Resource.cpp | 173 ++++++++++++++++++++
  src/gallium/frontends/d3d10umd/State.h      |  19 +++
  src/gallium/targets/d3d10umd/d3d10_gdi.c    |  27 +++
- 5 files changed, 225 insertions(+), 1 deletion(-)
+ 5 files changed, 226 insertions(+), 1 deletion(-)
 
 diff --git a/src/gallium/frontends/d3d10umd/Device.cpp b/src/gallium/frontends/d3d10umd/Device.cpp
 index 131187f..eb5b96f 100644
@@ -42,19 +42,20 @@ index 72b6d12..45c97c9 100644
           d3d10_wait_idle(device->hDevice);
           d3d10_perf_add(D3D10_PERF_IDLE_IN_PRESENT, t0);
 diff --git a/src/gallium/frontends/d3d10umd/Resource.cpp b/src/gallium/frontends/d3d10umd/Resource.cpp
-index aeedcb1..f3e5c55 100644
+index aeedcb1..c25149f 100644
 --- a/src/gallium/frontends/d3d10umd/Resource.cpp
 +++ b/src/gallium/frontends/d3d10umd/Resource.cpp
-@@ -43,6 +43,8 @@
+@@ -43,6 +43,9 @@
  #include "util/u_surface.h"
  #include "util/mali_slow.h"
  #include "frontend/winsys_handle.h"
++#include "pipe/p_shader_tokens.h"
 +#include "tgsi/tgsi_text.h"
 +#include "nir/tgsi_to_nir.h"
  
  #include <io.h>
  
-@@ -142,6 +144,176 @@ SwitchFileAbsent(const char *path, const char *what_absent, const char *what_pre
+@@ -142,6 +145,176 @@ SwitchFileAbsent(const char *path, const char *what_absent, const char *what_pre
  }
  
  
