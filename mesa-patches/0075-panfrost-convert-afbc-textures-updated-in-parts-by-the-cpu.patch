@@ -1,0 +1,44 @@
+diff --git a/src/gallium/drivers/panfrost/pan_resource.c b/src/gallium/drivers/panfrost/pan_resource.c
+index 89ee540..236f2ec 100644
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -1606,6 +1606,25 @@ panfrost_ptr_map_body(struct pipe_context *pctx, struct pipe_resource *resource,
+    if (usage & PIPE_MAP_WRITE)
+       rsrc->constant_stencil = false;
+ 
++   /* A compressed texture the CPU keeps updating in parts (Minecraft's
++    * block atlas: every animated sprite, every mip level, every frame) is
++    * converted once to a layout the CPU can write. Each update to it as
++    * AFBC is a staging texture, a blit and a flush of its own: hundreds of
++    * GPU submissions a frame, at about 100 us each through WDDM
++    * (2026-11-19: 600 submits and 4-8 fps). Whole-texture overwrites are
++    * panfrost_should_linear_convert's case. */
++   if ((usage & PIPE_MAP_WRITE) && !rsrc->modifier_constant &&
++       (drm_is_afbc(rsrc->modifier) || drm_is_afrc(rsrc->modifier)) &&
++       panfrost_is_2d(rsrc) && rsrc->base.nr_samples <= 1 &&
++       ++rsrc->partial_updates >= LAYOUT_CONVERT_THRESHOLD) {
++      uint64_t to = panfrost_should_tile(dev, rsrc, rsrc->base.format)
++                       ? DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED
++                       : DRM_FORMAT_MOD_LINEAR;
++      pan_resource_modifier_convert(ctx, rsrc, to, true,
++                                    "Frequent partial CPU updates");
++      bo = rsrc->bo;
++   }
++
+    /* We don't have s/w routines for AFBC/AFRC, so use a staging texture */
+    if (drm_is_afbc(rsrc->modifier) ||
+        drm_is_afrc(rsrc->modifier)) {
+diff --git a/src/gallium/drivers/panfrost/pan_resource.h b/src/gallium/drivers/panfrost/pan_resource.h
+index 0e2f8fd..2f6a722 100644
+--- a/src/gallium/drivers/panfrost/pan_resource.h
++++ b/src/gallium/drivers/panfrost/pan_resource.h
+@@ -86,6 +86,9 @@ struct panfrost_resource {
+    /* Used to decide when to convert to another modifier */
+    uint16_t modifier_updates;
+ 
++   /* CPU writes to part of an AFBC/AFRC texture (panfrost_ptr_map_body) */
++   uint16_t partial_updates;
++
+    /* Do all pixels have the same stencil value? */
+    bool constant_stencil;
+ 

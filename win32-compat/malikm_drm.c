@@ -697,7 +697,8 @@ munmap(void *addr, size_t len)
 typedef NTSTATUS (APIENTRY *KMT_FN)(void *);
 static struct {
    KMT_FN CreateDevice, DestroyDevice, CreateContext, CreateAllocation, DestroyAllocation,
-          Lock, Unlock, Render, Escape, EnumAdapters2, WaitForIdle;
+          Lock, Unlock, Render, Escape, EnumAdapters2, WaitForIdle,
+          SignalSynchronizationObject2;
 } kmt;
 
 struct wbo {
@@ -733,6 +734,14 @@ static UINT wpatch_size;
 static MW_ESCAPE_GPU_INFO_DATA wgpu;
 static uint64_t wseq;
 static int wddm = -1;
+/* The D3DKMT path's completion events (an OpenGL process): what
+ * ddi.last_event is to a runtime device. Without them every "is this BO
+ * busy" became a D3DKMTWaitForIdle of the whole queue, several times a
+ * frame: OpenGL on Panfrost waited for the GPU in each SwapBuffers and
+ * BO-cache lookup (gltest at 854x480, 2026-11-19: 13 fps, 47 ms in
+ * SwapBuffers). kmt_events is 1 while every submission has one. */
+static HANDLE klast_event;
+static int kmt_events;
 static SRWLOCK wddm_lock = SRWLOCK_INIT;
 
 /* wddm_lock, timed: a long wait here is another thread's wait for the GPU
@@ -781,6 +790,15 @@ static struct {
  * A context's submissions complete in order, so the newest event that is
  * signalled says every submission up to its number is done. A BO is busy
  * while the last submission that named it is newer than that. */
+/* The last submission's completion event, either path; NULL if it has none. */
+static HANDLE
+last_event(void)
+{
+   if (ddi.on)
+      return ddi.last_unsignalled ? NULL : ddi.last_event;
+   return kmt_events ? klast_event : NULL;
+}
+
 #define WRING 64
 static struct wring {
    uint64_t seq[WRING];
@@ -1060,6 +1078,7 @@ wddm_init(void)
 #define R(n) kmt.n = kmt_resolve(#n)
    R(CreateDevice); R(DestroyDevice); R(CreateContext); R(CreateAllocation); R(DestroyAllocation);
    R(Lock); R(Unlock); R(Render); R(Escape); R(EnumAdapters2); R(WaitForIdle);
+   R(SignalSynchronizationObject2);    /* optional: completion events, below */
 #undef R
    if (!kmt.CreateDevice || !kmt.CreateContext || !kmt.CreateAllocation || !kmt.DestroyAllocation ||
        !kmt.Lock || !kmt.Unlock || !kmt.Render || !kmt.Escape || !kmt.EnumAdapters2 || !kmt.WaitForIdle)
@@ -1244,6 +1263,27 @@ w_render_inner(UINT commandLength, UINT allocations)
    walloc_size = r.NewAllocationListSize;
    wpatch = r.pNewPatchLocationList;
    wpatch_size = r.NewPatchLocationListSize;
+
+   /* As the runtime path: a CPU event the scheduler sets when the context
+    * gets here, that is, when this submission is done. */
+   kmt_events = 0;
+   if (kmt.SignalSynchronizationObject2) {
+      HANDLE ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+      if (ev) {
+         D3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 sig = {0};
+         sig.hContext = wcontext;
+         sig.Flags.EnqueueCpuEvent = 1;
+         sig.CpuEventHandle = ev;
+         if (kmt.SignalSynchronizationObject2(&sig) >= 0) {
+            if (klast_event)
+               CloseHandle(klast_event);
+            klast_event = ev;
+            kmt_events = 1;
+         } else {
+            CloseHandle(ev);
+         }
+      }
+   }
    return 0;
 }
 
@@ -1300,6 +1340,8 @@ wddm_idle(const char *why)
          ret = -MK_ETIMEDOUT;
       else if (ddi.last_unsignalled)
          ret = wddm_poll_idle();
+   } else if (kmt_events && klast_event) {
+      ret = WaitForSingleObject(klast_event, 10000) == WAIT_OBJECT_0 ? 0 : -MK_ETIMEDOUT;
    } else {
       D3DKMT_WAITFORIDLE w = {0};
       w.hDevice = wdevice;
@@ -1365,7 +1407,12 @@ wddm_idle_within(int64_t timeout_ns, int busy, const char *why)
    uint64_t slow_t0 = mali_slow_now();
    int ret;
 
-   if (!wait_keeps_timeout() || !ddi.on || timeout_ns == MALIKM_TIMEOUT_INFINITE ||
+   if (!ddi.on && kmt_events && wait_keeps_timeout() && timeout_ns != MALIKM_TIMEOUT_INFINITE &&
+       timeout_ns < 10000000000ll) {
+      /* D3DKMT path with completion events: the last one, within the timeout. */
+      DWORD ms = (DWORD)((timeout_ns + 999999) / 1000000);
+      ret = !klast_event || WaitForSingleObject(klast_event, ms) == WAIT_OBJECT_0 ? wddm_idle(why) : busy;
+   } else if (!wait_keeps_timeout() || !ddi.on || timeout_ns == MALIKM_TIMEOUT_INFINITE ||
        timeout_ns >= 10000000000ll) {
       ret = wddm_idle(why);
    } else if (!ddi.last_event && !ddi.last_unsignalled) {
@@ -2250,7 +2297,7 @@ wddm_drm(uint32_t nr, uint8_t *b, uint32_t size)
       struct wbo *bo = wddm_bo(a->handle);
       if (!bo)
          return -MK_ENOENT;
-      if (wait_keeps_timeout() && ddi.on) {
+      if (wait_keeps_timeout() && (ddi.on || kmt_events)) {
          /* Is the last submission that named this BO done? */
          uint64_t slow_t0 = mali_slow_now();
          HANDLE ev;
@@ -2340,8 +2387,8 @@ wddm_drm(uint32_t nr, uint8_t *b, uint32_t size)
          if (bo)
             bo->used = wseq;
       }
-      if (ddi.on && !ddi.last_unsignalled)
-         wring_push(wseq, ddi.last_event);
+      if (last_event())
+         wring_push(wseq, last_event());
       return 0;
    }
    case MALIKM_NR_GEM_CLOSE: {
